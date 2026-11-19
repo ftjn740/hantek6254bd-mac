@@ -1,5 +1,11 @@
-# v0.1.0 release candidate
+# Hantek 6254BD for Mac · v0.1.0-rc2
 
+- Download the macOS arm64 ZIP, unzip it and open **Hantek 6254BD.app**.
+  This preview targets Apple Silicon and macOS 15 or later. Python, Tk, PyUSB
+  and libusb are bundled. The app is ad hoc signed and macOS may ask you to
+  allow the first launch in Privacy & Security.
+- **Acquire… → Open SAMPLE** opens the included waveform offline.
+  Use `SHA256SUMS` to check the ZIP and source downloads.
 - The Mac front panel includes hardware edge triggering, single-shot and
   continuous display, selectable sample rates and depths, measurements,
   persistence, averaging, CSV export, and raw record replay.

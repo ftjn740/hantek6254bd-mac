@@ -1,3 +1,4 @@
+import sys
 import time
 import math
 import statistics
@@ -5,8 +6,10 @@ import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 from bisect import bisect_right
 from collections import deque
+from pathlib import Path
 from waveform import Waveform, BlockAverage, channel_delay, write_csv
 from bench_driver import BenchDriver, RANGES, depths_for, sampling_clock
+from usb_transport import usb_backend
 import usb.core
 
 BG, PANEL, GRID, FG, MUTED = "#11181e", "#202a32", "#324149", "#e5edf1", "#9daeb7"
@@ -17,6 +20,7 @@ MANUAL_RATES = (125_000, 250_000, 500_000, 1_250_000, 2_500_000, 5_000_000,
                 12_500_000, 25_000_000, 50_000_000, 125_000_000, 250_000_000,
                 500_000_000, 1_000_000_000)
 PROBES = ("1×", "10×", "100×")
+SAMPLE_RECORD = Path(__file__).with_name("SAMPLE-CH1-CH2.hk6254")
 
 
 def fmt(value, unit):
@@ -263,6 +267,7 @@ class Scope:
         row=tk.Frame(win,bg=PANEL)
         row.pack(fill="x",pady=4)
         self.button(row,"Open record…",self.open_record).pack(side="left")
+        self.button(row,"Open SAMPLE",self.open_sample).pack(side="left",padx=4)
         self.button(row,"Save record…",self.save_record).pack(side="right")
 
     def sync_acquisition_controls(self):
@@ -313,6 +318,12 @@ class Scope:
                 self.load_record(name)
             except (OSError,ValueError) as exc:
                 messagebox.showerror("Open waveform",str(exc))
+
+    def open_sample(self):
+        try:
+            self.load_record(SAMPLE_RECORD)
+        except (OSError,ValueError) as exc:
+            messagebox.showerror("Open SAMPLE",str(exc))
 
     def load_record(self,name):
         wave,frame,count=Waveform.load(name)
@@ -994,10 +1005,35 @@ class Scope:
 
 
 
-if __name__=="__main__":
-    window=tk.Tk()
-    import sys
-    panel=Scope(window)
-    if len(sys.argv)==2:
+def main():
+    window = tk.Tk()
+    panel = Scope(window)
+    if sys.argv[1:] == ["--smoke-test"]:
+        try:
+            backend = usb_backend()
+            if backend is None:
+                raise RuntimeError("libusb backend did not load")
+            # Exercise the compiled library without opening or claiming a device.
+            list(usb.core.find(find_all=True, backend=backend))
+            panel.load_record(SAMPLE_RECORD)
+            window.update_idletasks()
+            panel.tick()
+            measured = [row[2] for row in panel.stats[:2]]
+            if panel.device is not None or not all(f and abs(f-1000)<5 for f in measured):
+                raise RuntimeError(f"Unexpected offline SAMPLE measurements: {measured}")
+            visible = panel.width
+            panel.time.set("20 µs")
+            panel.horizontal()
+            if panel.width >= visible:
+                raise RuntimeError("SAMPLE zoom check failed")
+            print(f"Tk {window.tk.call('info', 'patchlevel')}; libusb loaded; SAMPLE {measured} Hz")
+        finally:
+            panel.close()
+        return
+    if len(sys.argv) == 2:
         panel.load_record(sys.argv[1])
     window.mainloop()
+
+
+if __name__ == "__main__":
+    main()

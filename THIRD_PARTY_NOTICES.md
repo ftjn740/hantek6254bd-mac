@@ -20,7 +20,10 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 Install [PyUSB](https://github.com/pyusb/pyusb) and
 [libusb](https://github.com/libusb/libusb) separately using the README.
-Review the dependencies' own licenses if packaging their binaries.
+The macOS app bundle includes the license texts under `Contents/Resources/Licenses`
+and records its runtime versions. Its libusb 1.0.29 shared library is compiled
+from the corresponding LGPL source archive attached to the Release. The build
+commands are in `packaging/build-macos.sh`.
 
 The acquisition code uses hardware protocol facts and register values. Earlier
 development also used [pyhantek](https://github.com/danielkucera/pyhantek)

@@ -19,3 +19,5 @@ __pycache__/
 /6254BD-SAMPLE.png
 /6254BD-hardware-trigger.png
 /6254BD-measurements.png
+/build/
+/dist/

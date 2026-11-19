@@ -1,10 +1,23 @@
 """USB transport and startup adapted from BSD-2-Clause libhantek6xx4."""
 
 import struct
+import sys
 import time
+from pathlib import Path
 
+import usb.backend.libusb1
 import usb.core
 import usb.util
+
+
+def usb_backend():
+    if getattr(sys, "frozen", False):
+        library = Path(sys._MEIPASS) / "libusb-1.0.0.dylib"
+        backend = usb.backend.libusb1.get_backend(find_library=lambda _: str(library))
+        if backend is None:
+            raise OSError("The app could not load its bundled libusb")
+        return backend
+    return usb.backend.libusb1.get_backend()
 
 
 class ScopeUSB:
@@ -13,7 +26,7 @@ class ScopeUSB:
     TIMEOUT_MS = 1000
 
     def __init__(self):
-        device = usb.core.find(idVendor=0x04b5, idProduct=0x6cde)
+        device = usb.core.find(idVendor=0x04b5, idProduct=0x6cde, backend=usb_backend())
         if device is None:
             raise ValueError("Hantek 6254BD not found")
         self.dev = device

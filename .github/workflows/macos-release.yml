@@ -1,0 +1,80 @@
+name: macOS package
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Select version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            echo "value=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=v0.0.0-rc${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Python and Tk
+        run: brew install python@3.13 python-tk@3.13
+      - name: Build and verify application
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: packaging/build-macos.sh "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: dist/${{ steps.version.outputs.value }}/
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64
+          path: artifacts
+      - name: Publish checked artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd artifacts && sha256sum -c SHA256SUMS)
+          flags=()
+          if [[ "$VERSION" == *-rc* ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$VERSION" --notes-file RELEASE_NOTES.md "${flags[@]}" \
+            artifacts/"hantek6254bd-$VERSION-macos-arm64.zip" \
+            artifacts/"hantek6254bd-$VERSION-source.tar.gz" \
+            artifacts/libusb-1.0.29.tar.bz2 artifacts/SHA256SUMS
