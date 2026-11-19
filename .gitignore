@@ -1,0 +1,21 @@
+.scope-env/
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.csv
+*.hk6254
+!/SAMPLE-CH1-CH2.hk6254
+*.log
+*.pyz
+/releases/
+/ngscopeclient.app/
+/pyhantek/
+/libhantek6xx4/
+/capture.py
+/6254BD 波形回放.command
+/6254BD-replay.scopesession
+/6254BD-replay_data/
+/6254BD-SAMPLE.png
+/6254BD-hardware-trigger.png
+/6254BD-measurements.png
