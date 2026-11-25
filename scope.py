@@ -936,8 +936,15 @@ class Scope:
         bar_r=l+(r-l)*(self.view_left+self.span)/self.record.depth
         c.create_line(l,4,r,4,fill=GRID,width=2)
         c.create_line(bar_l,4,bar_r,4,fill=MUTED,width=2)
-        if self.record.trigger_index is not None and l<=xt<=r:
-            c.create_polygon(xt-6,t-10,xt+6,t-10,xt,t,fill="#eaaa5e")
+        # Match the time axis even on an Auto timeout, which uses the record midpoint.
+        # Allow the same sub-sample rounding error as the visible sample slice.
+        if pre < -1e-9:
+            points=(l,t-5,l+9,t-10,l+9,t)
+        elif pre > self.span+1e-9:
+            points=(r,t-5,r-9,t-10,r-9,t)
+        else:
+            points=(xt-6,t-10,xt+6,t-10,xt,t)
+        zero_marker=c.create_polygon(*points,fill="#eaaa5e",tags="time_zero")
         for n in (0,2,4,5,6,8,10):
             x=l+n*dx
             c.create_text(x,b+12,text=fmt(0 if abs(n-pre/self.span*10)<.005 else (n-pre/self.span*10)*div,"s"),fill=MUTED,font=("Helvetica",10))
@@ -990,7 +997,10 @@ class Scope:
             cursor_text=f"CH{self.ch+1}   ΔV   {fmt(delta,'V')}"
         else:
             return
-        c.create_text(r,t-10,text=cursor_text,anchor="e",fill=FG)
+        readout=c.create_text(r,t-10,text=cursor_text,anchor="e",fill=FG)
+        if zero_marker in c.find_overlapping(*c.bbox(readout)):
+            c.coords(readout,l,t-10)
+            c.itemconfigure(readout,anchor="w")
 
     def save(self):
         if self.frame is None:
