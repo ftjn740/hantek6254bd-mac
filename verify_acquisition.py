@@ -131,10 +131,9 @@ def check_front_panel(sample_file):
                       f" | span {depth/rate*1000:.4f} ms")
         scope.depth.set(4096)
         scope.manual_rate.set(fmt(5e6,"Sa/s"))
-        previous=scope.count
-        scope.acquire()
-        assert scope.count==previous and "10,000 pts/ch required" in scope.window_info.get()
-        assert "16,384" in scope.window_info.get()
+        wait_frame(scope)
+        assert scope.depth.get()==scope.record.depth==16384
+        scope.depth.set(4096)
         scope.scales[:2]=[10,10]
         scope.time.set("5 ns")
         scope.autoscale()

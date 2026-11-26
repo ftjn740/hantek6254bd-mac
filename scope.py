@@ -2,6 +2,7 @@ import sys
 import time
 import math
 import statistics
+from tempfile import NamedTemporaryFile
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 from bisect import bisect_right
@@ -20,7 +21,19 @@ MANUAL_RATES = (125_000, 250_000, 500_000, 1_250_000, 2_500_000, 5_000_000,
                 12_500_000, 25_000_000, 50_000_000, 125_000_000, 250_000_000,
                 500_000_000, 1_000_000_000)
 PROBES = ("1×", "10×", "100×")
+PROBE_PREFS = Path.home() / "Library" / "Application Support" / "Hantek 6254BD"
 SAMPLE_RECORD = Path(__file__).with_name("SAMPLE-CH1-CH2.hk6254")
+
+
+def load_probe_factors():
+    factors = []
+    for channel in range(1, 5):
+        try:
+            value = (PROBE_PREFS / f"probe-ch{channel}").read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            value = "1"
+        factors.append(int(value) if f"{value}×" in PROBES else 1)
+    return factors
 
 
 def fmt(value, unit):
@@ -94,7 +107,8 @@ class Scope:
         self.device = self.frame = self.record = None
         self.scales = [.1,.1,.5,.5]
         self.coupling = ["DC"]*4
-        self.probes = [1]*4
+        self.live_probes = load_probe_factors()
+        self.probes = self.live_probes.copy()
         self.positions = [.8,-2.6,0,0]
         self.visible = [True,True,False,False]
         self.ch = 0
@@ -177,13 +191,6 @@ class Scope:
         self.canvas.bind("<Configure>",lambda e:self.draw())
         self.canvas.bind("<Button-1>",self.cursor_press)
         self.canvas.bind("<B1-Motion>",self.cursor_move)
-        self.tabs=tk.Frame(left,bg=BG)
-        self.tabs.pack(fill="x",pady=5)
-        self.channel_buttons=[]
-        for i in range(4):
-            b=self.button(self.tabs,"",lambda n=i:self.select(n))
-            b.pack(side="left",expand=True,fill="x",padx=2)
-            self.channel_buttons.append(b)
         table=tk.Frame(left,bg=BG)
         table.pack(fill="x")
         headings=("Input", "Range / coupling / probe", "Vpp", "Frequency", "Period", "Duty", "")
@@ -204,8 +211,15 @@ class Scope:
                 cells.append(cell)
             self.measures.append(cells)
         self.section(side,"VERTICAL")
-        self.active=self.label(side,"",14,COLORS[0],True)
-        self.active.pack(anchor="w")
+        channels=tk.Frame(side,bg=PANEL)
+        channels.pack(fill="x")
+        self.channel_buttons=[]
+        for i in range(4):
+            button=self.button(channels,f"CH{i+1}",lambda n=i:self.select(n))
+            button.configure(padx=2,pady=2,highlightthickness=2)
+            channels.columnconfigure(i,weight=1,uniform="channel")
+            button.grid(row=0,column=i,sticky="ew",padx=1)
+            self.channel_buttons.append(button)
         self.on=self.button(side,"",self.visibility)
         self.on.pack(anchor="w",pady=2)
         self.scbox=self.combo(side,"Scale / div",self.scale,[],self.changed)
@@ -462,7 +476,6 @@ class Scope:
         if i>=n:
             return
         self.ch=i
-        self.active.configure(text=f"Channel {i+1}",fg=COLORS[i])
         self.on.configure(text="Display  ON" if self.visible[i] else "Display  OFF")
         values=[fmt(v*self.probes[i],"V") for v in RANGES]
         self.scbox.configure(values=values)
@@ -471,11 +484,14 @@ class Scope:
         self.probe.set(f"{self.probes[i]}×")
         self.position.set(self.positions[i])
         for j,b in enumerate(self.channel_buttons):
-            if j>=n:
-                b.configure(text=f"CH{j+1}   Inactive",fg=MUTED,bg=PANEL,cursor="arrow",takefocus=False)
-                continue
-            b.configure(cursor="hand2",takefocus=True,text=f"CH{j+1}   {fmt(self.scales[j]*self.probes[j],'V')}/div" if self.visible[j] else f"CH{j+1}   Off",
-                        fg=COLORS[j] if self.visible[j] else MUTED,bg="#374954" if i==j else PANEL)
+            enabled=j<n
+            selected=j==i
+            b.configure(state="normal" if enabled else "disabled",
+                        cursor="hand2" if enabled else "arrow",takefocus=enabled,
+                        fg=COLORS[j] if selected or self.visible[j] else MUTED,
+                        disabledforeground=MUTED,
+                        bg="#374954" if selected else "#29363e" if enabled else PANEL,
+                        highlightbackground=COLORS[j] if selected else PANEL)
 
     def visibility(self):
         self.visible[self.ch]=not self.visible[self.ch]
@@ -499,10 +515,20 @@ class Scope:
         self.rearm()
 
     def change_probe(self):
-        self.probes[self.ch]=int(self.probe.get()[:-1])
+        factor=int(self.probe.get()[:-1])
+        self.probes[self.ch]=self.live_probes[self.ch]=factor
         self.select(self.ch)
         self.trigger_range()
         self.rearm()
+
+        try:
+            PROBE_PREFS.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(mode="w", dir=PROBE_PREFS, delete_on_close=False) as temp:
+                temp.write(str(factor))
+                temp.close()
+                Path(temp.name).replace(PROBE_PREFS / f"probe-ch{self.ch+1}")
+        except OSError as exc:
+            messagebox.showwarning("Probe preference", f"Probe changed for this session. Could not save it.\n{exc}")
 
     def source_index(self):
         return int(self.source.get()[-1])-1
@@ -652,11 +678,15 @@ class Scope:
         rate,_,_=sampling_clock(desired,inputs)
         depth=self.depth.get()
         needed=max(2,math.ceil(div*10*rate-1e-8))
+        if needed>depth:
+            for candidate in depths_for(inputs):
+                if candidate>=needed:
+                    depth=candidate
+                    self.depth.set(depth)
+                    break
         if needed>depth or div*10*rate<1.99:
-            fits=[f"{v:,}" for v in depths_for(inputs) if v>=needed]
             if needed>depth:
-                choices="available depths "+", ".join(fits) if fits else "shorten time/div or lower the rate"
-                warning=f"{needed:,} pts/ch required · {choices}"
+                warning=f"{needed:,} pts/ch required · shorten time/div or lower the rate"
             else:
                 warning="Window contains fewer than two samples · increase time/div or rate"
             self.new_arm()
@@ -664,6 +694,10 @@ class Scope:
             self.foot.configure(text=warning)
             self.indicator.configure(text="CONFIG")
             return
+        if self.replay and self.probes != self.live_probes:
+            self.probes = self.live_probes.copy()
+            self.select(self.ch)
+            self.trigger_range()
         if self.device is None:
             self.device=BenchDriver()
         self.device.apply(self.scales,self.coupling,rate,depth,inputs)
