@@ -113,7 +113,7 @@ def check_high_speed(device):
 
 def check_front_panel(sample_file):
     root=tk.Tk()
-    scope=Scope(root)
+    scope=Scope(root, setup_dir=None)
     root.update_idletasks()
     try:
         scope.show_tools()
@@ -235,7 +235,7 @@ def check_front_panel(sample_file):
     # Fresh App instance, with USB opening made impossible for this replay test.
     replay_root=tk.Tk()
     with patch("scope.BenchDriver",side_effect=AssertionError("Offline replay tried USB")):
-        replay=Scope(replay_root)
+        replay=Scope(replay_root, setup_dir=None)
         try:
             replay.load_record(sample_file)
             replay.tick()

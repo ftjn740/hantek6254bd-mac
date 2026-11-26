@@ -14,7 +14,7 @@ class TimeZeroTest(unittest.TestCase):
         guard.start()
         self.addCleanup(guard.stop)
         self.root = tk.Tk()
-        self.panel = Scope(self.root)
+        self.panel = Scope(self.root, setup_dir=None)
         self.addCleanup(self.panel.close)
         self.canvas = self.panel.canvas
         self.root.update_idletasks()
@@ -46,9 +46,9 @@ class TimeZeroTest(unittest.TestCase):
     def test_auto_timeout_then_wait_and_stop(self):
         device = Mock(actual_rate=7_812_500, trigger_index=None)
         self.panel.device = device
-        device.capture_edge.return_value = (self.panel.record.raw, False, 0)
-        self.panel.time.set("20 µs")
+        device.capture_edge.return_value = (self.panel.record.raw[:2], False, 0)
         self.panel.toggle()
+        self.panel.time.set("20 µs")
         self.panel.acquire()
         self.assertIn("Auto timeout", self.panel.foot["text"])
         self.panel.delay.set(0.5)

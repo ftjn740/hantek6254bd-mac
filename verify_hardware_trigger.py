@@ -24,7 +24,7 @@ def fingerprint(frame):
 def check():
     root = tk.Tk()
     root.withdraw()
-    panel = Scope(root)
+    panel = Scope(root, setup_dir=None)
     try:
         panel.mode.set("Normal")
         for ch in (0, 1):

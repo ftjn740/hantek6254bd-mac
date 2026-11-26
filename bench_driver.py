@@ -12,6 +12,10 @@ CLOCK = 125_000_000
 DEPTHS = (4096, 8192, 16384, 32768, 65536)
 
 
+def lane_count(channels):
+    return 4 if len(channels) >= 3 else len(channels)
+
+
 def depths_for(inputs):
     return tuple(depth for depth in DEPTHS if depth * inputs <= 65536)
 
@@ -80,13 +84,11 @@ class BenchDriver(ScopeUSB):
         self.bwrite(struct.pack('<BBB H BBB', 8, 0, 0, value, register, 4, 0))
         time.sleep(.003)
 
-    def route(self, inputs):
-        registers = {
-            4: (63, 0x0810, 0x0204, 0x0204),
-            2: (48, 0x1010, 0x0808, 0x0102),
-            1: (25, 0x1010, 0x1010, 0x0001),
-        }
-        fullscale, low, high, clock = registers[inputs]
+    def route(self, inputs, order):
+        # On the 6254BD PCB the BNC inputs select ADC mux bits 4,3,2,1.
+        mux = [16 >> ch for ch in order[:inputs] for _ in range(4 // inputs)]
+        low, high = mux[0] | mux[1]<<8, mux[2] | mux[3]<<8
+        fullscale, clock = {4:(63,0x0204), 2:(48,0x0102), 1:(25,0x0001)}[inputs]
         self.adc(0x55, fullscale)
         self.adc(0x3a, low)
         self.adc(0x3b, high)
@@ -94,30 +96,38 @@ class BenchDriver(ScopeUSB):
         self.adc(0x31, clock)
 
     def apply(self, ranges, coupling, rate, depth=4096, inputs=4):
-        if inputs not in (1, 2, 4) or depth not in depths_for(inputs):
+        channels = tuple(range(inputs)) if isinstance(inputs,int) else tuple(inputs)
+        if not channels or channels != tuple(sorted(set(channels))) or any(ch not in range(4) for ch in channels):
+            raise ValueError("Invalid physical inputs")
+        inputs = lane_count(channels)
+        if depth not in depths_for(inputs):
             raise ValueError("Record does not fit physical memory")
         actual_rate, divider, multiplier = sampling_clock(rate, inputs)
-        desired = (tuple(ranges), tuple(coupling), actual_rate, depth, inputs)
+        desired = (tuple(ranges), tuple(coupling), actual_rate, depth, channels)
         if self.settings == desired:
             return
         adc_inputs = min(4, 8 // multiplier)
-        route_changed = getattr(self, "adc_inputs", None) != adc_inputs
+        # Three inputs still occupy four FPGA lanes. Duplicate an enabled
+        # input in the unused lane and omit that lane from the returned record.
+        order = channels + tuple(ch for ch in range(4) if ch not in channels)
+        if len(channels) == 3:
+            order = channels + (channels[-1],)
+        route_changed = self.settings is None or self.adc_inputs != adc_inputs or self.channels != channels
         if route_changed:
-            self.route(adc_inputs)
+            self.route(adc_inputs, order)
+        self.channels = channels
         self.adc_inputs = adc_inputs
         self.trigger_config = None
         if route_changed or self.settings is None or self.settings[:2] != desired[:2]:
             bits = []
-            gain = 0
             for i, (v, dc) in enumerate(zip(ranges, coupling)):
-                index = RANGES.index(v)
                 bits.append(2 | (4 if dc == 'DC' else 0) |
                             (32 if v <= 1 else 64) | (8 if v <= .1 else 16))
-                gain |= GAINS[index] << (4*i)
             self.bwrite(bytes([8, 0, *bits, 1, 0]))
             time.sleep(.004)
             self.bwrite(bytes([8, 0, *(b & 0x86 for b in bits), 1, 1]))
             time.sleep(.05)
+            gain = sum(GAINS[RANGES.index(ranges[ch])] << (4*lane) for lane,ch in enumerate(order))
             if adc_inputs == 4:
                 self.adc(0x2a, gain)
             else:
@@ -151,7 +161,7 @@ class BenchDriver(ScopeUSB):
                 mask = (1 << self.inputs) - 1
                 interleave = self.multiplier.bit_length() - 1
                 discard = (8 // self.inputs).bit_length() - 1 - interleave
-                self.bwrite([0x12, 0, (mask << 2) | discard, 0, interleave, source])
+                self.bwrite([0x12, 0, (mask << 2) | discard, 0, interleave, self.channels.index(source)])
                 self.bwrite([0x11, 0, 0, int(falling), 0, 0])
                 hi, lo = min(255, center+3), max(0, center-3)
                 self.bwrite([7, 0] + [hi, hi, lo, lo]*4 + [center]*8)
@@ -199,4 +209,4 @@ class BenchDriver(ScopeUSB):
         data = self.bread(length)
         if len(data) != length:
             raise IOError("Incomplete USB record")
-        return [bytes(data[i::self.inputs]) for i in range(self.inputs)]
+        return [bytes(data[i::self.inputs]) for i in range(len(self.channels))]

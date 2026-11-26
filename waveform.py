@@ -24,6 +24,11 @@ class Waveform:
     level: float
     trigger_index: int | None
     time_div: float
+    channels: tuple = ()
+
+    def __post_init__(self):
+        if not self.channels:
+            object.__setattr__(self, "channels", tuple(range(len(self.raw))))
 
     @property
     def depth(self):
@@ -35,8 +40,8 @@ class Waveform:
 
     def save(self, filename, displayed=None, averages=1):
         data = asdict(self)
-        data.update(version=1, raw=[base64.b64encode(ch).decode() for ch in self.raw],
-                    channels=list(range(1, len(self.raw)+1)))
+        data.update(version=1 if self.channels == tuple(range(len(self.raw))) and len(self.raw)!=3 else 2, raw=[base64.b64encode(ch).decode() for ch in self.raw],
+                    channels=[i+1 for i in self.channels])
         if averages > 1:
             data.update(averages=averages, average=displayed)
         path=Path(filename)
@@ -56,23 +61,27 @@ class Waveform:
             raise ValueError("Waveform file too large")
         try:
             data=json.loads(path.read_text())
-            if data.pop("version")!=1:
+            version=data.pop("version")
+            if version not in (1,2):
                 raise ValueError("Unsupported waveform version")
             avg=data.pop("average",None)
             count=data.pop("averages",1)
             ids=data.pop("channels")
+            if not isinstance(ids,list) or not ids or any(type(i) is not int or i not in range(1,5) for i in ids) or ids!=sorted(set(ids)):
+                raise ValueError("Invalid physical channels")
+            data["channels"]=tuple(i-1 for i in ids)
             data["raw"]=tuple(base64.b64decode(ch,validate=True) for ch in data["raw"])
             for setting in ("scales","probes","couplings"):
                 data[setting]=tuple(data[setting])
             wave=cls(**data)
             n=len(wave.raw)
-            if n not in (1,2,4) or ids!=list(range(1,n+1)) or wave.depth not in (4096,8192,16384,32768,65536):
+            if n!=len(ids) or (version==1 and (n==3 or ids!=list(range(1,n+1)))) or wave.depth not in (4096,8192,16384,32768,65536):
                 raise ValueError("Invalid acquisition dimensions")
-            if n*wave.depth>65536 or any(len(ch)!=wave.depth for ch in wave.raw):
+            if (4 if n==3 else n)*wave.depth>65536 or any(len(ch)!=wave.depth for ch in wave.raw):
                 raise ValueError("Unequal channel lengths")
             if not (0<wave.rate<=1e9 and 0<wave.time_div<=1000 and math.isfinite(wave.level)):
                 raise ValueError("Invalid timing or level")
-            if wave.source not in range(n) or wave.slope not in ("Rising","Falling"):
+            if wave.source not in wave.channels or wave.slope not in ("Rising","Falling"):
                 raise ValueError("Invalid trigger")
             if wave.trigger_index is not None and (type(wave.trigger_index)!=int or not 0<=wave.trigger_index<wave.depth):
                 raise ValueError("Invalid trigger index")
@@ -95,7 +104,7 @@ class BlockAverage:
         self.count=0
 
     def add(self,wave,target):
-        key=(wave.rate,wave.scales,wave.probes,wave.couplings,wave.depth,len(wave.raw),
+        key=(wave.rate,wave.scales,wave.probes,wave.couplings,wave.depth,wave.channels,
              wave.source,wave.slope,wave.level,wave.time_div,target)
         if target==1 or wave.trigger_index is None:
             self.key=None
@@ -140,12 +149,12 @@ def channel_delay(first,second,rate):
 
 
 def write_csv(filename, wave, displayed, averages):
-    inputs=range(len(wave.raw))
+    inputs=wave.channels
     volts="avg_V" if averages>1 else "V"
     with open(filename,"w",newline="") as out:
         writer=csv.writer(out)
         writer.writerow(["time_s",*(f"CH{i+1}_{volts}" for i in inputs),
                          *(f"CH{i+1}_code" for i in inputs)])
         for k in range(wave.depth):
-            values=[(displayed[i][k]-128)*wave.scales[i]*wave.probes[i]/25 for i in inputs]
+            values=[(displayed[lane][k]-128)*wave.scales[i]*wave.probes[i]/25 for lane,i in enumerate(inputs)]
             writer.writerow([(k-wave.origin)/wave.rate,*values,*(ch[k] for ch in wave.raw)])

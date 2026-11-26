@@ -37,8 +37,9 @@ python3.13 -m venv .scope-env
   captured SAMPLE square wave.
 - **Live capture, 实时采集**　Connect the 6254BD over a high-speed USB link.
   Run `./Hantek6254BD.command` or double-click it in Finder. The front panel
-  starts in Run mode. Use **Acquire…** to set the physical channel group,
-  sample rate and record length. **Single** captures one hardware-triggered
+  starts in Run mode. Select a channel under **VERTICAL** and use **Input ON/OFF**
+  to include its BNC in the capture. **Acquire… → Rate control → Max** tracks
+  the highest per-channel rate for the enabled inputs. **Single** captures one hardware-triggered
   record. **Save CSV** and **Save record…** export the displayed frame.
 - **Hardware checks, 硬件复验**　Close the live window, connect SAMPLE to CH1
   and CH2, and run both checks below.

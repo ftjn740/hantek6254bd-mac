@@ -2,34 +2,30 @@ import sys
 import time
 import math
 import statistics
-from tempfile import NamedTemporaryFile
+from instrument_setup import ARRAYS, CONTROLS, INPUT_MODES, MANUAL_RATES, input_label, preset_path, read_setup, write_setup
 import tkinter as tk
-from tkinter import filedialog, ttk, messagebox
+from tkinter import filedialog, ttk, messagebox, simpledialog
 from bisect import bisect_right
 from collections import deque
 from pathlib import Path
 from waveform import Waveform, BlockAverage, channel_delay, write_csv
-from bench_driver import BenchDriver, RANGES, depths_for, sampling_clock
+from bench_driver import BenchDriver, RANGES, depths_for, sampling_clock, lane_count
 from usb_transport import usb_backend
 import usb.core
 
 BG, PANEL, GRID, FG, MUTED = "#11181e", "#202a32", "#324149", "#e5edf1", "#9daeb7"
 COLORS = ("#ffdb51", "#64dbed", "#f099cf", "#98dc89")
 TIME = tuple(x*10**e for e in (-9,-8,-7,-6,-5,-4,-3) for x in (1,2,5))
-INPUT_MODES = {"CH1–4":4, "CH1 + CH2":2, "CH1 only":1}
-MANUAL_RATES = (125_000, 250_000, 500_000, 1_250_000, 2_500_000, 5_000_000,
-                12_500_000, 25_000_000, 50_000_000, 125_000_000, 250_000_000,
-                500_000_000, 1_000_000_000)
 PROBES = ("1×", "10×", "100×")
 PROBE_PREFS = Path.home() / "Library" / "Application Support" / "Hantek 6254BD"
 SAMPLE_RECORD = Path(__file__).with_name("SAMPLE-CH1-CH2.hk6254")
 
 
-def load_probe_factors():
+def load_probe_factors(directory):
     factors = []
     for channel in range(1, 5):
         try:
-            value = (PROBE_PREFS / f"probe-ch{channel}").read_text(encoding="ascii").strip()
+            value = (directory / f"probe-ch{channel}").read_text(encoding="ascii").strip()
         except (OSError, UnicodeError):
             value = "1"
         factors.append(int(value) if f"{value}×" in PROBES else 1)
@@ -98,7 +94,12 @@ def measure(data, rate):
 
 
 class Scope:
-    def __init__(self, root):
+    def __init__(self, root, setup_dir=PROBE_PREFS):
+        self.setup_dir = setup_dir
+        self.last_saved = None
+        self.save_error = None
+        self.setup_timer = None
+        self.recall_window = None
         self.root = root
         root.title("Hantek 6254BD  ·  Digital Oscilloscope")
         root.geometry("1220x770")
@@ -107,8 +108,7 @@ class Scope:
         self.device = self.frame = self.record = None
         self.scales = [.1,.1,.5,.5]
         self.coupling = ["DC"]*4
-        self.live_probes = load_probe_factors()
-        self.probes = self.live_probes.copy()
+        self.probes = [1]*4
         self.positions = [.8,-2.6,0,0]
         self.visible = [True,True,False,False]
         self.ch = 0
@@ -120,7 +120,7 @@ class Scope:
         self.manual_rate=tk.StringVar(value="1.25 MSa/s")
         self.rates={fmt(v,"Sa/s"):v for v in MANUAL_RATES}
         self.depth=tk.IntVar(value=4096)
-        self.input_mode=tk.StringVar(value="CH1–4")
+        self.input_mode=tk.StringVar(value="CH1 + CH2")
         self.average=tk.IntVar(value=1)
         self.averager=BlockAverage()
         self.average_count=1
@@ -251,7 +251,161 @@ class Scope:
         root.protocol("WM_DELETE_WINDOW",self.close)
         self.select(0)
         self.trigger_range()
-        root.after(120,self.tick)
+        self.factory_setup = self.capture_setup()
+        self.live_setup = self.factory_setup
+        if setup_dir is not None:
+            self.install_setup_menu()
+            try:
+                self.last_saved = read_setup(setup_dir / "last-setup.json")
+                self.apply_setup(self.last_saved)
+            except FileNotFoundError:
+                self.probes = load_probe_factors(setup_dir)
+                self.select(0)
+                self.trigger_range()
+            except (OSError, ValueError) as exc:
+                messagebox.showwarning("Startup setup", f"Using Default Setup.\n{exc}", parent=root)
+            self.setup_timer = root.after(350, self.poll_setup)
+        if root.tk.call("tk", "windowingsystem") == "aqua":
+            root.createcommand("tk::mac::Quit", self.close)
+        self.tick_timer = root.after(120,self.tick)
+
+    def capture_setup(self):
+        setup = {key: getattr(self, key).get() for key in CONTROLS}
+        setup.update({key: list(getattr(self, key)) for key in ARRAYS})
+        setup.update(version=2, ch=self.ch, time_div=self.selected_time(),
+                     manual_rate=self.rates[self.manual_rate.get()])
+        return setup
+
+    def flush_setup(self):
+        if self.setup_dir is None or self.autopending:
+            return
+        setup = self.live_setup if self.replay else self.capture_setup()
+        if setup == self.last_saved:
+            return
+        try:
+            write_setup(self.setup_dir / "last-setup.json", setup)
+            self.last_saved = setup
+            self.save_error = None
+        except (OSError, ValueError) as exc:
+            if str(exc) != self.save_error:
+                self.save_error = str(exc)
+                self.foot.configure(text=f"Could not save startup setup · {exc}")
+
+    def poll_setup(self):
+        self.flush_setup()
+        self.setup_timer = self.root.after(350, self.poll_setup)
+
+    def leave_replay(self):
+        if self.replay:
+            self.apply_setup(self.live_setup)
+
+    def apply_setup(self, setup):
+        # Drop the previous record before publishing new controls or measurements.
+        self.new_arm()
+        self.autopending = self.replay = False
+        self.record = self.frame = None
+        self.state = "Run" if self.state == "Run" else "Stop"
+        self.run_key.configure(text="■  Stop" if self.state == "Run" else "▶  Run")
+        self.indicator.configure(text=self.state.upper())
+        self.clear_analysis()
+        self.canvas.delete("all")
+        self.counter.configure(text="")
+        self.readout.configure(text="Waiting for capture")
+        self.details.set("")
+        self.window_info.set("")
+        for key in ARRAYS:
+            setattr(self, key, list(setup[key]))
+        self.ch = setup["ch"]
+        self.div = setup["time_div"]
+        self.time.set(fmt(self.div,"s"))
+        self.manual_rate.set(fmt(setup["manual_rate"],"Sa/s"))
+        for key in CONTROLS:
+            if key not in ("delay","level"):
+                getattr(self,key).set(setup[key])
+        self.sync_acquisition_controls()
+        self.trigger_range()
+        self.level.set(setup["level"])
+        delay = setup["delay"]
+        self.delay_limits = (min(-3,delay), max(3,delay))
+        self.delay_slider.configure(from_=self.delay_limits[0], to=self.delay_limits[1])
+        self.delay.set(delay)
+        self.gate_text.set(f"Measure · {self.region.get()}")
+        for cells in self.measures:
+            for cell in cells:
+                cell.configure(text="")
+                cell.grid_remove()
+        self.foot.configure(text="Setup loaded")
+
+    def install_setup_menu(self):
+        bar = tk.Menu(self.root)
+        menu = tk.Menu(bar, tearoff=False)
+        menu.add_command(label="Save Setup As…", command=self.save_preset)
+        menu.add_command(label="Recall Setup…", command=self.show_presets)
+        menu.add_separator()
+        menu.add_command(label="Default Setup", command=lambda: self.apply_setup(self.factory_setup))
+        bar.add_cascade(label="Setup", menu=menu)
+        self.root.configure(menu=bar)
+
+    def save_preset(self):
+        name = simpledialog.askstring("Save Setup As", "Preset name", parent=self.root)
+        if name is None:
+            return
+        try:
+            path = preset_path(self.setup_dir, name)
+            setup = self.live_setup if self.replay else self.capture_setup()
+            try:
+                write_setup(path, setup, overwrite=False)
+            except FileExistsError:
+                if not messagebox.askyesno("Replace setup", f"Replace “{name}”?", parent=self.root):
+                    return
+                write_setup(path, setup)
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Save Setup As", str(exc), parent=self.root)
+            return
+        self.foot.configure(text=f"Saved setup · {path.stem}")
+
+    def show_presets(self):
+        if self.recall_window and self.recall_window.winfo_exists():
+            self.recall_window.lift()
+            return
+        win = self.recall_window = tk.Toplevel(self.root)
+        win.title("Recall Setup")
+        win.transient(self.root)
+        names = tk.Listbox(win, width=36, height=10, exportselection=False)
+        names.pack(fill="both", expand=True, padx=10, pady=10)
+        directory = self.setup_dir / "Presets"
+        for path in sorted(directory.glob("*.json"), key=lambda p:p.stem.casefold()):
+            names.insert("end",path.stem)
+        names.selection_set(0)
+        actions = ttk.Frame(win)
+        actions.pack(fill="x",padx=10,pady=(0,10))
+
+        def choose(delete=False):
+            selected = names.curselection()
+            if not selected:
+                return
+            name = names.get(selected[0])
+            path = preset_path(self.setup_dir, name)
+            try:
+                if delete:
+                    if messagebox.askyesno("Delete setup", f"Delete “{name}”?", parent=win):
+                        path.unlink()
+                        names.delete(selected[0])
+                        names.selection_set(min(selected[0],names.size()-1))
+                else:
+                    self.apply_setup(read_setup(path))
+                    self.foot.configure(text=f"Recalled setup · {name}")
+                    win.destroy()
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("Recall Setup", str(exc), parent=win)
+
+        ttk.Button(actions,text="Delete…",command=lambda:choose(True)).pack(side="left")
+        ttk.Button(actions,text="Recall",command=choose).pack(side="right")
+        names.bind("<Double-Button-1>",lambda event:choose())
+        names.bind("<Return>",lambda event:choose())
+        win.bind("<Escape>",lambda event:win.destroy())
+        names.focus_set()
+        win.grab_set()
 
     def show_tools(self):
         if self.tools_window is not None and self.tools_window.winfo_exists():
@@ -261,10 +415,10 @@ class Scope:
         win.title("Acquire & Measure · 6254BD")
         win.configure(bg=PANEL,padx=16,pady=12)
         self.section(win,"ACQUIRE")
-        self.combo(win,"Physical inputs",self.input_mode,list(INPUT_MODES),self.acquisition_changed)
-        self.combo(win,"Rate control",self.acq_mode,["Auto","Manual"],self.acquisition_changed)
+        self.input_box=self.combo(win,"Physical inputs",self.input_mode,list(INPUT_MODES),self.acquisition_changed)
+        self.combo(win,"Rate control",self.acq_mode,["Auto","Manual","Max"],self.acquisition_changed)
         self.rate_box=self.combo(win,"Manual rate",self.manual_rate,list(self.rates),self.acquisition_changed)
-        self.depth_box=self.combo(win,"Samples / input",self.depth,depths_for(INPUT_MODES[self.input_mode.get()]),self.acquisition_changed)
+        self.depth_box=self.combo(win,"Samples / input",self.depth,depths_for(lane_count(INPUT_MODES[self.input_mode.get()]) or 1),self.acquisition_changed)
         self.sync_acquisition_controls()
         tk.Label(win,textvariable=self.window_info,bg=PANEL,fg=FG,justify="left",anchor="w",width=53).pack(anchor="w",pady=5)
         view=tk.Frame(win,bg=PANEL)
@@ -285,26 +439,32 @@ class Scope:
         self.button(row,"Save record…",self.save_record).pack(side="right")
 
     def sync_acquisition_controls(self):
-        n=INPUT_MODES[self.input_mode.get()]
+        group=INPUT_MODES[self.input_mode.get()]
+        n=lane_count(group) or 1
+        if not self.replay:
+            self.visible=[i in group for i in range(4)]
         depths=depths_for(n)
         self.depth.set(min(self.depth.get(),max(depths)))
         rates=[name for name,rate in self.rates.items() if rate<=1e9/n]
         if self.manual_rate.get() not in rates:
             self.manual_rate.set(rates[-1])
         if self.tools_window and self.tools_window.winfo_exists():
+            self.input_box.configure(state="disabled" if self.replay else "readonly")
             self.depth_box.configure(values=depths)
             self.rate_box.configure(values=rates,state="readonly" if self.acq_mode.get()=="Manual" else "disabled")
-        self.source_box.configure(values=[f"CH{i+1}" for i in range(n)])
-        if self.source_index()>=n:
-            self.source.set("CH1")
+        self.source_box.configure(values=[f"CH{i+1}" for i in group], state="readonly" if group else "disabled")
+        if group and self.source_index() not in group:
+            self.source.set(f"CH{group[0]+1}")
             self.trigger_range()
-        self.select(min(self.ch,n-1))
+        self.select(self.ch if not self.replay or self.ch in group else group[0])
 
     def acquisition_changed(self):
+        self.autopending=False
         self.sync_acquisition_controls()
         self.new_arm()
         self.clear_analysis()
         self.rearm()
+        self.refresh_view()
 
     def clear_history(self):
         self.history.clear()
@@ -341,6 +501,10 @@ class Scope:
 
     def load_record(self,name):
         wave,frame,count=Waveform.load(name)
+        if not self.replay:
+            self.live_setup = self.capture_setup()
+            self.flush_setup()
+        self.autopending = False
         self.new_arm()
         self.state="Stop"
         self.replay=True
@@ -352,8 +516,8 @@ class Scope:
         self.scales,self.coupling,self.probes=list(wave.scales),list(wave.couplings),list(wave.probes)
         self.source.set(f"CH{wave.source+1}")
         self.slope.set(wave.slope)
-        self.input_mode.set(next(k for k,v in INPUT_MODES.items() if v==len(wave.raw)))
-        self.source_box.configure(values=[f"CH{i+1}" for i in range(len(wave.raw))])
+        self.input_mode.set(input_label(wave.channels))
+        self.visible=[i in wave.channels for i in range(4)]
         self.trigger_range()
         self.level.set(wave.level)
         self.depth.set(wave.depth)
@@ -472,11 +636,18 @@ class Scope:
         return box
 
     def select(self,i):
-        n=INPUT_MODES[self.input_mode.get()]
-        if i>=n:
+        group=INPUT_MODES[self.input_mode.get()]
+        if self.replay and i not in group:
             return
         self.ch=i
-        self.on.configure(text="Display  ON" if self.visible[i] else "Display  OFF")
+        if self.replay:
+            label="Display ON" if self.visible[i] else "Display OFF"
+        elif not group:
+            label="Input OFF · No active inputs"
+        else:
+            maximum=fmt(1e9/lane_count(group),"Sa/s")
+            label=f"Input {'ON' if i in group else 'OFF'}   ·   Max {maximum}/ch"
+        self.on.configure(text=label)
         values=[fmt(v*self.probes[i],"V") for v in RANGES]
         self.scbox.configure(values=values)
         self.scale.set(fmt(self.scales[i]*self.probes[i],"V"))
@@ -484,7 +655,7 @@ class Scope:
         self.probe.set(f"{self.probes[i]}×")
         self.position.set(self.positions[i])
         for j,b in enumerate(self.channel_buttons):
-            enabled=j<n
+            enabled=not self.replay or j in group
             selected=j==i
             b.configure(state="normal" if enabled else "disabled",
                         cursor="hand2" if enabled else "arrow",takefocus=enabled,
@@ -494,6 +665,12 @@ class Scope:
                         highlightbackground=COLORS[j] if selected else PANEL)
 
     def visibility(self):
+        if not self.replay:
+            group=set(INPUT_MODES[self.input_mode.get()])
+            group.symmetric_difference_update([self.ch])
+            self.input_mode.set(input_label(sorted(group)))
+            self.acquisition_changed()
+            return
         self.visible[self.ch]=not self.visible[self.ch]
         self.select(self.ch)
         for cell in self.measures[self.ch]:
@@ -516,19 +693,10 @@ class Scope:
 
     def change_probe(self):
         factor=int(self.probe.get()[:-1])
-        self.probes[self.ch]=self.live_probes[self.ch]=factor
+        self.probes[self.ch]=factor
         self.select(self.ch)
         self.trigger_range()
         self.rearm()
-
-        try:
-            PROBE_PREFS.mkdir(parents=True, exist_ok=True)
-            with NamedTemporaryFile(mode="w", dir=PROBE_PREFS, delete_on_close=False) as temp:
-                temp.write(str(factor))
-                temp.close()
-                Path(temp.name).replace(PROBE_PREFS / f"probe-ch{self.ch+1}")
-        except OSError as exc:
-            messagebox.showwarning("Probe preference", f"Probe changed for this session. Could not save it.\n{exc}")
 
     def source_index(self):
         return int(self.source.get()[-1])-1
@@ -543,9 +711,9 @@ class Scope:
         self.midlevel()
 
     def midlevel(self):
-        if self.frame and self.source_index()<len(self.frame):
+        if self.frame and self.source_index() in self.record.channels:
             i=self.source_index()
-            lo,hi,*_=self.stats[i]
+            lo,hi,*_=self.stats[self.record.channels.index(i)]
             self.level.set(((lo+hi)/2-128)*self.record.scales[i]*self.record.probes[i]/25)
         self.rearm()
 
@@ -624,6 +792,7 @@ class Scope:
             self.device.pending=None
 
     def toggle(self):
+        self.leave_replay()
         self.new_arm()
         self.autopending=False
         self.state="Run" if self.state=="Stop" else "Stop"
@@ -631,6 +800,7 @@ class Scope:
         self.indicator.configure(text=self.state.upper())
 
     def single(self):
+        self.leave_replay()
         self.new_arm()
         self.autopending=False
         self.clear_analysis()
@@ -639,6 +809,7 @@ class Scope:
         self.indicator.configure(text="ARMED")
 
     def autoscale(self):
+        self.leave_replay()
         self.new_arm()
         self.state="Run"
         self.run_key.configure(text="■  Stop")
@@ -646,13 +817,15 @@ class Scope:
         self.time.set(fmt(.0002,"s"))
         self.acq_mode.set("Auto")
         self.sync_acquisition_controls()
-        if not any(self.visible[:INPUT_MODES[self.input_mode.get()]]):
-            self.visibility()
         self.autoscale_attempt=0
         self.autopending=True
         self.mode.set("Auto")
 
     def close(self):
+        if self.setup_timer is not None:
+            self.root.after_cancel(self.setup_timer)
+        self.root.after_cancel(self.tick_timer)
+        self.flush_setup()
         if self.device:
             self.device.close()
         self.root.destroy()
@@ -665,16 +838,26 @@ class Scope:
                 if self.device:
                     self.device.close()
                     self.device=None
+                self.autopending=False
                 self.state="Stop"
                 self.run_key.configure(text="▶  Run")
                 self.indicator.configure(text="STOP")
                 self.foot.configure(text=str(exc))
-        self.root.after(10 if self.device and self.device.pending else 40,self.tick)
+        self.tick_timer = self.root.after(10 if self.device and self.device.pending else 40,self.tick)
 
     def acquire(self):
         div=self.selected_time()
-        inputs=INPUT_MODES[self.input_mode.get()]
+        group=INPUT_MODES[self.input_mode.get()]
+        if not group:
+            self.indicator.configure(text="IDLE")
+            self.readout.configure(text="No active inputs")
+            self.window_info.set("No active inputs")
+            self.foot.configure(text="Enable an input to acquire")
+            return
+        inputs=lane_count(group)
         desired=self.rates[self.manual_rate.get()] if self.acq_mode.get()=="Manual" else 160/div
+        if self.acq_mode.get()=="Max":
+            desired=1e9/inputs
         rate,_,_=sampling_clock(desired,inputs)
         depth=self.depth.get()
         needed=max(2,math.ceil(div*10*rate-1e-8))
@@ -694,13 +877,9 @@ class Scope:
             self.foot.configure(text=warning)
             self.indicator.configure(text="CONFIG")
             return
-        if self.replay and self.probes != self.live_probes:
-            self.probes = self.live_probes.copy()
-            self.select(self.ch)
-            self.trigger_range()
         if self.device is None:
             self.device=BenchDriver()
-        self.device.apply(self.scales,self.coupling,rate,depth,inputs)
+        self.device.apply(self.scales,self.coupling,rate,depth,group)
         i=self.source_index()
         threshold=128+25*self.level.get()/(self.scales[i]*self.probes[i])
         auto=self.mode.get()=="Auto" and self.state!="Single"
@@ -717,19 +896,18 @@ class Scope:
         actual=self.device.actual_rate
         stats=[measure(data,actual) for data in frame]
         if self.autopending:
-            candidates=[j for j,st in enumerate(stats) if self.visible[j] and st[1]-st[0]>=6 and st[2]]
+            by_channel=dict(zip(group,stats))
+            candidates=[j for j,st in by_channel.items() if st[1]-st[0]>=6 and st[2]]
             if candidates:
                 i=i if i in candidates else candidates[0]
                 self.source.set(f"CH{i+1}")
             if self.autoscale_attempt<5:
                 rescan=False
-                for j in range(inputs):
-                    if not self.visible[j]:
-                        continue
+                for lane,j in enumerate(group):
                     current=RANGES.index(self.scales[j])
-                    if min(frame[j])==0 or max(frame[j])==255:
+                    if min(frame[lane])==0 or max(frame[lane])==255:
                         desired=min(len(RANGES)-1,current+3)
-                    elif stats[j][1]-stats[j][0]<6:
+                    elif by_channel[j][1]-by_channel[j][0]<6:
                         desired=max(0,current-2)
                     else:
                         continue
@@ -740,7 +918,7 @@ class Scope:
                     self.autoscale_attempt+=1
                     return
             centers={}
-            for j,(lo,hi,_,_) in enumerate(stats):
+            for j,(lo,hi,_,_) in by_channel.items():
                 if self.visible[j]:
                     centers[j]=((lo+hi)/2-128)*self.scales[j]/25
                     target=(hi-lo)*self.scales[j]/25/min(2.5,6/max(1,len(candidates)))
@@ -750,10 +928,10 @@ class Scope:
             for rank,j in enumerate(centers):
                 center=4-8*(rank+.5)/len(centers)
                 self.positions[j]=max(-4,min(4,center-centers[j]/self.scales[j]))
-            freq=stats[i][2]
+            freq=by_channel[i][2]
             if freq:
                 self.time.set(fmt(min(TIME,key=lambda t:abs(math.log(t*freq*10/3))),"s"))
-            lo,hi=stats[i][:2]
+            lo,hi=by_channel[i][:2]
             oldscale=self.device.settings[0][i]
             self.trigger_range()
             self.level.set(((lo+hi)/2-128)*oldscale*self.probes[i]/25)
@@ -762,9 +940,9 @@ class Scope:
             self.trigger_range()
             return
         wave=Waveform(tuple(frame),actual,tuple(self.scales),tuple(self.probes),tuple(self.coupling),
-                      i,self.slope.get(),self.level.get(),self.device.trigger_index,div)
+                      i,self.slope.get(),self.level.get(),self.device.trigger_index,div,group)
         self.replay=False
-        key=(wave.rate,wave.depth,len(frame),wave.scales,wave.couplings,wave.probes,i,wave.slope,wave.level,div)
+        key=(wave.rate,wave.depth,wave.channels,wave.scales,wave.couplings,wave.probes,i,wave.slope,wave.level,div)
         if key!=getattr(self,"history_key",None) or not locked:
             self.history.clear()
         self.history_key=key
@@ -792,25 +970,26 @@ class Scope:
         self.gate_text.set(f"Measure · {self.region.get()}")
         details=[f"{self.region.get()} · sample interval {fmt(1/wave.rate,'s')}",
                  f"{'Input':<6}{'High':>10}{'Low':>10}{'Amplitude':>12}{'Mean':>11}"]
-        edge_lists=[]
+        edge_lists={}
         for i,cells in enumerate(self.measures):
-            if i>=len(self.frame):
+            if i not in wave.channels or not self.visible[i]:
                 for cell in cells:
                     cell.grid_remove()
                 continue
             if self.visible[i] and not cells[0].winfo_manager():
                 for cell in cells:
                     cell.grid()
-            data=self.frame[i]
+            lane=wave.channels.index(i)
+            data=self.frame[lane]
             vdiv=wave.scales[i]*wave.probes[i]
             if self.region.get()=="Visible window":
                 data=data[self.start:self.start+self.width]
                 low,high,freq,duty=measure(data,wave.rate)
             else:
-                low,high,freq,duty=self.stats[i]
+                low,high,freq,duty=self.stats[lane]
             gain=vdiv/25
             minimum,maximum=min(data),max(data)
-            raw=wave.raw[i][self.start:self.start+self.width] if self.region.get()=="Visible window" else wave.raw[i]
+            raw=wave.raw[lane][self.start:self.start+self.width] if self.region.get()=="Visible window" else wave.raw[lane]
             clipped=min(raw)==0 or max(raw)==255
             values=[f"CH{i+1}",f"{fmt(vdiv,'V')}  {wave.couplings[i]}  {wave.probes[i]}×"]
             for col,(value,unit) in enumerate((((maximum-minimum)*gain,"V"),(freq,"Hz"),(1/freq if freq else None,"s"))):
@@ -821,7 +1000,7 @@ class Scope:
                 if cell["text"]!=text:
                     cell.configure(text=text)
             crossings=edges(data,(low+high)/2) if high-low>=6 else []
-            edge_lists.append(crossings)
+            edge_lists[i]=crossings
             if self.visible[i]:
                 quality=[]
                 if clipped:
@@ -837,8 +1016,8 @@ class Scope:
                 details.append(f"CH{i+1:<4}{high_v:>10}{low_v:>10}{amplitude:>12}{mean:>11}")
                 if quality:
                     details.append("      "+" · ".join(quality))
-        if len(edge_lists)>=2 and all(self.visible[:2]):
-            details.append("\nCH1 → CH2 rising Δt   "+fmt(channel_delay(*edge_lists[:2],wave.rate),"s"))
+        if 0 in edge_lists and 1 in edge_lists:
+            details.append("\nCH1 → CH2 rising Δt   "+fmt(channel_delay(edge_lists[0],edge_lists[1],wave.rate),"s"))
         self.details.set("\n".join(details))
 
     def cursor_fraction(self,event):
@@ -880,7 +1059,7 @@ class Scope:
             height=max(1,self.canvas.winfo_height()-46)
             center=22+height/2
             if event.x<34:
-                choices=[i for i in range(len(self.frame)) if self.visible[i] and i<INPUT_MODES[self.input_mode.get()]]
+                choices=[i for i in self.record.channels if self.visible[i]]
                 if choices:
                     i=min(choices,key=lambda n:abs(event.y-center+self.positions[n]*height/8))
                     if abs(event.y-center+self.positions[i]*height/8)<20:
@@ -894,7 +1073,7 @@ class Scope:
                 self.marker_drag="delay"
             elif event.y<=self.canvas.winfo_height()-24:
                 channel=self.trace_at(event.x,event.y)
-                if channel is not None and channel<INPUT_MODES[self.input_mode.get()]:
+                if channel is not None and channel in self.record.channels:
                     self.select(channel)
                     self.trace_anchor=(event.x,event.y,self.positions[channel],self.delay.get())
                     self.marker_drag="trace"
@@ -982,7 +1161,7 @@ class Scope:
         for n in (0,2,4,5,6,8,10):
             x=l+n*dx
             c.create_text(x,b+12,text=fmt(0 if abs(n-pre/self.span*10)<.005 else (n-pre/self.span*10)*div,"s"),fill=MUTED,font=("Helvetica",10))
-        for j,data in enumerate(self.frame):
+        for lane,(j,data) in enumerate(zip(self.record.channels,self.frame)):
             if not self.visible[j]:
                 continue
             displayed_div=self.scales[j]*self.probes[j]
@@ -1010,8 +1189,8 @@ class Scope:
                 if len(points)>=4:
                     c.create_line(*points,fill=color,width=1,capstyle="butt",joinstyle="round",tags=tags)
             for origin,prior in self.history:
-                if j<len(prior):
-                    trace(prior[j],self.view_left+origin-self.record.origin,("#665826","#27565c","#68445a","#425c40")[j])
+                if lane<len(prior):
+                    trace(prior[lane],self.view_left+origin-self.record.origin,("#665826","#27565c","#68445a","#425c40")[j])
             trace(data,self.view_left,COLORS[j],("trace",f"ch{j}"))
         if self.cursor.get()=="Time":
             a,z=self.cursor_x
@@ -1051,7 +1230,7 @@ class Scope:
 
 def main():
     window = tk.Tk()
-    panel = Scope(window)
+    panel = Scope(window, None if sys.argv[1:] == ["--smoke-test"] else PROBE_PREFS)
     if sys.argv[1:] == ["--smoke-test"]:
         try:
             backend = usb_backend()
